@@ -6,7 +6,7 @@ on:
   workflow_dispatch:      # Кнопка для ручного запуску
   push:
     paths:
-      - 'update'          # Примусовий білд при зміні цього файлу
+      - 'update'          # Примусовий білд при зміні файлу update
 
 jobs:
   check_and_build:
@@ -18,22 +18,24 @@ jobs:
       - name: Checkout your repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Потрібно для роботи з історією комітів
+          fetch-depth: 0
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
-          cache: 'gradle'
+          # Авто-кеш вимкнено, щоб уникнути помилок шляхів
 
       - name: Clone and Find Stable Commit
         id: build_logic
         run: |
+          # Очищення робочого простору
+          rm -rf source
           git clone https://github.com/PlusMarden17/ferrum.git source
           cd source
           
-          # Отримуємо список останніх 15 комітів
+          # Список останніх 15 комітів
           COMMITS=$(git rev-list --max-count=15 HEAD)
           
           SUCCESS_SHA=""
@@ -42,18 +44,22 @@ jobs:
             echo "------------------------------------------------"
             echo "Checking commit: $SHA"
             
-            # Очищуємо все перед переходом
             git reset --hard
             git checkout $SHA
             chmod +x gradlew
             
-            # Спроба збірки (без тестів для швидкості)
+            # Запуск збірки без тестів
             if ./gradlew clean assemble -x test --no-daemon; then
-              echo "SUCCESS: Commit $SHA is stable!"
-              SUCCESS_SHA=$SHA
-              break
+              # Перевірка наявності JAR
+              if ls build/libs/*.jar 1> /dev/null 2>&1; then
+                echo "SUCCESS: Commit $SHA is stable and JAR exists!"
+                SUCCESS_SHA=$SHA
+                break
+              else
+                echo "FAILED: Build finished but no JAR found in build/libs/"
+              fi
             else
-              echo "FAILED: Commit $SHA is broken. Trying previous..."
+              echo "FAILED: Compilation error on $SHA"
             fi
           done
           
@@ -64,7 +70,7 @@ jobs:
           
           echo "stable_sha=$SUCCESS_SHA" >> $GITHUB_OUTPUT
           
-          # Зберігаємо готовий файл
+          # Підготовка файлу для релізу
           mkdir -p ../output
           cp build/libs/*.jar ../output/ferrum.jar
 
@@ -85,8 +91,8 @@ jobs:
           tag_name: v${{ steps.build_logic.outputs.stable_sha }}-${{ github.run_number }}
           name: "Stable Build: ${{ steps.build_logic.outputs.stable_sha }}"
           body: |
-            Автоматична збірка знайдена шляхом відкату до стабільного коміту.
-            Оригінальний коміт: ${{ steps.build_logic.outputs.stable_sha }}
+            Автоматична збірка знайдена шляхом перебору комітів.
+            Коміт: ${{ steps.build_logic.outputs.stable_sha }}
             Використано Java 21.
           files: output/ferrum.jar
         env:
