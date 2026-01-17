@@ -2,12 +2,15 @@ name: Watch and Build Ferrum
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Перевіряти кожні 15 хвилин (найчастіше в GitHub)
-  workflow_dispatch:      # Кнопка для ручного запуску
+    - cron: '*/15 * * * *' 
+  workflow_dispatch:      
 
 jobs:
   check_and_build:
     runs-on: ubuntu-latest
+    permissions: # Важливо для створення релізів та запису в репо
+      contents: write
+    
     steps:
       - name: Checkout your repo
         uses: actions/checkout@v4
@@ -18,19 +21,20 @@ jobs:
           SHA=$(curl -s https://api.github.com/repos/PlusMarden17/ferrum/commits/master | jq -r '.sha')
           echo "sha=$SHA" >> $GITHUB_OUTPUT
 
-      - name: Cache Build Status
-        id: cache_status
-        uses: actions/cache@v4
-        with:
-          path: last_sha.txt
-          key: ferrum-sha-${{ steps.get_sha.outputs.sha }}
+      - name: Check if SHA is new
+        id: check_sha
+        run: |
+          if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" == "${{ steps.get_sha.outputs.sha }}" ]; then
+            echo "match=true" >> $GITHUB_OUTPUT
+          else
+            echo "match=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Exit if no new changes
-        if: steps.cache_status.outputs.cache-hit == 'true'
-        run: echo "No new commits found. Skipping build." && exit 0
-
-      - name: Save new SHA to file
-        run: echo "${{ steps.get_sha.outputs.sha }}" > last_sha.txt
+        if: steps.check_sha.outputs.match == 'true'
+        run: |
+          echo "No new commits found. Skipping build."
+          exit 0
 
       - name: Clone Original Ferrum
         run: git clone https://github.com/PlusMarden17/ferrum.git source
@@ -50,8 +54,18 @@ jobs:
       - name: Create Release and Upload JAR
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ steps.get_sha.outputs.sha }}
-          name: Build from Ferrum commit ${{ steps.get_sha.outputs.sha }}
+          tag_name: v${{ steps.get_sha.outputs.sha }}
+          name: "Auto-Build: ${{ steps.get_sha.outputs.sha }}"
+          body: "Автоматична збірка на основі останнього коміту PlusMarden17/ferrum."
           files: source/build/libs/*.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update last_sha.txt in repo
+        run: |
+          echo "${{ steps.get_sha.outputs.sha }}" > last_sha.txt
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add last_sha.txt
+          git commit -m "Update last built SHA to ${{ steps.get_sha.outputs.sha }}"
+          git push
