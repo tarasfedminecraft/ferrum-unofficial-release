@@ -2,13 +2,16 @@ name: Watch and Build Ferrum
 
 on:
   schedule:
-    - cron: '*/15 * * * *' 
-  workflow_dispatch:      
+    - cron: '*/15 * * * *' # Перевірка кожні 15 хвилин
+  workflow_dispatch:      # Кнопка для ручного запуску
+  push:
+    paths:
+      - 'update'          # Примусовий білд при зміні цього файлу
 
 jobs:
   check_and_build:
     runs-on: ubuntu-latest
-    permissions: # Важливо для створення релізів та запису в репо
+    permissions:
       contents: write
     
     steps:
@@ -21,19 +24,31 @@ jobs:
           SHA=$(curl -s https://api.github.com/repos/PlusMarden17/ferrum/commits/master | jq -r '.sha')
           echo "sha=$SHA" >> $GITHUB_OUTPUT
 
-      - name: Check if SHA is new
-        id: check_sha
+      - name: Check Status (New Commit or Forced)
+        id: check_status
         run: |
-          if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" == "${{ steps.get_sha.outputs.sha }}" ]; then
-            echo "match=true" >> $GITHUB_OUTPUT
+          # Перевіряємо, чи запуск викликаний зміною файлу 'update'
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.event.head_commit.message }}" == *"update"* ]]; then
+             echo "forced=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+             # Будь-який пуш у файл 'update'
+             echo "forced=true" >> $GITHUB_OUTPUT
           else
-            echo "match=false" >> $GITHUB_OUTPUT
+             echo "forced=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Перевіряємо старий SHA
+          if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" == "${{ steps.get_sha.outputs.sha }}" ]; then
+             echo "match=true" >> $GITHUB_OUTPUT
+          else
+             echo "match=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Exit if no new changes
-        if: steps.check_sha.outputs.match == 'true'
+        # Виходимо тільки якщо SHA співпадає І це НЕ примусовий запуск через файл 'update'
+        if: steps.check_status.outputs.match == 'true' && steps.check_status.outputs.forced == 'false'
         run: |
-          echo "No new commits found. Skipping build."
+          echo "No new commits found and not forced. Skipping build."
           exit 0
 
       - name: Clone Original Ferrum
@@ -51,13 +66,19 @@ jobs:
           chmod +x gradlew
           ./gradlew build
 
+      - name: Rename JAR for consistency
+        run: mv source/build/libs/*.jar source/build/libs/ferrum.jar
+
       - name: Create Release and Upload JAR
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.get_sha.outputs.sha }}
-          name: "Auto-Build: ${{ steps.get_sha.outputs.sha }}"
-          body: "Автоматична збірка на основі останнього коміту PlusMarden17/ferrum."
-          files: source/build/libs/*.jar
+          tag_name: v${{ steps.get_sha.outputs.sha }}-${{ github.run_number }}
+          name: "Build: ${{ steps.get_sha.outputs.sha }}"
+          body: |
+            Автоматична збірка бібліотеки Ferrum.
+            Коміт: ${{ steps.get_sha.outputs.sha }}
+            Тип запуску: ${{ steps.check_status.outputs.forced == 'true' && 'Примусовий (update)' || 'Автоматичний' }}
+          files: source/build/libs/ferrum.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -67,5 +88,5 @@ jobs:
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
           git add last_sha.txt
-          git commit -m "Update last built SHA to ${{ steps.get_sha.outputs.sha }}"
+          git commit -m "Update last built SHA to ${{ steps.get_sha.outputs.sha }} [skip ci]" || echo "No changes to commit"
           git push
