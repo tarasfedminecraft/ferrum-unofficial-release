@@ -1,12 +1,12 @@
-name: Watch and Build Ferrum (with Rollback)
+name: Watch and Build Ferrum (Java 21 Rollback)
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
-  workflow_dispatch:
+    - cron: '*/15 * * * *' # Перевірка кожні 15 хвилин
+  workflow_dispatch:      # Кнопка для ручного запуску
   push:
     paths:
-      - 'update'
+      - 'update'          # Примусовий білд при зміні цього файлу
 
 jobs:
   check_and_build:
@@ -18,33 +18,37 @@ jobs:
       - name: Checkout your repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Потрібно для роботи з історією комітів
 
-      - name: Set up JDK 8
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: '8'
+          java-version: '21'
           distribution: 'temurin'
+          cache: 'gradle'
 
       - name: Clone and Find Stable Commit
         id: build_logic
         run: |
           git clone https://github.com/PlusMarden17/ferrum.git source
           cd source
-          chmod +x gradlew
           
-          # Отримуємо список останніх 10 комітів
-          COMMITS=$(git log -n 10 --format="%H")
+          # Отримуємо список останніх 15 комітів
+          COMMITS=$(git rev-list --max-count=15 HEAD)
           
           SUCCESS_SHA=""
           
           for SHA in $COMMITS; do
             echo "------------------------------------------------"
             echo "Checking commit: $SHA"
-            git checkout $SHA
             
-            # Спроба збірки
-            if ./gradlew clean assemble; then
+            # Очищуємо все перед переходом
+            git reset --hard
+            git checkout $SHA
+            chmod +x gradlew
+            
+            # Спроба збірки (без тестів для швидкості)
+            if ./gradlew clean assemble -x test --no-daemon; then
               echo "SUCCESS: Commit $SHA is stable!"
               SUCCESS_SHA=$SHA
               break
@@ -54,12 +58,13 @@ jobs:
           done
           
           if [ -z "$SUCCESS_SHA" ]; then
-            echo "Error: None of the last 10 commits are buildable."
+            echo "Error: None of the last 15 commits are buildable."
             exit 1
           fi
           
           echo "stable_sha=$SUCCESS_SHA" >> $GITHUB_OUTPUT
-          # Копіюємо JAR для наступних кроків
+          
+          # Зберігаємо готовий файл
           mkdir -p ../output
           cp build/libs/*.jar ../output/ferrum.jar
 
@@ -79,12 +84,15 @@ jobs:
         with:
           tag_name: v${{ steps.build_logic.outputs.stable_sha }}-${{ github.run_number }}
           name: "Stable Build: ${{ steps.build_logic.outputs.stable_sha }}"
-          body: "Ця збірка знайдена автоматичним перебором останніх комітів до першого стабільного."
+          body: |
+            Автоматична збірка знайдена шляхом відкату до стабільного коміту.
+            Оригінальний коміт: ${{ steps.build_logic.outputs.stable_sha }}
+            Використано Java 21.
           files: output/ferrum.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update last_sha.txt
+      - name: Update last_sha.txt in repo
         if: steps.check_new.outputs.new_found == 'true'
         run: |
           echo "${{ steps.build_logic.outputs.stable_sha }}" > last_sha.txt
