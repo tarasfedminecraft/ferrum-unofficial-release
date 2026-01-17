@@ -1,12 +1,12 @@
-name: Watch and Build Ferrum
+name: Watch and Build Ferrum (with Rollback)
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Перевірка кожні 15 хвилин
-  workflow_dispatch:      # Кнопка для ручного запуску
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
   push:
     paths:
-      - 'update'          # Примусовий білд при зміні цього файлу
+      - 'update'
 
 jobs:
   check_and_build:
@@ -17,76 +17,79 @@ jobs:
     steps:
       - name: Checkout your repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Get Latest Commit SHA from Ferrum
-        id: get_sha
-        run: |
-          SHA=$(curl -s https://api.github.com/repos/PlusMarden17/ferrum/commits/master | jq -r '.sha')
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-
-      - name: Check Status (New Commit or Forced)
-        id: check_status
-        run: |
-          # Перевіряємо, чи запуск викликаний зміною файлу 'update'
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.event.head_commit.message }}" == *"update"* ]]; then
-             echo "forced=true" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-             # Будь-який пуш у файл 'update'
-             echo "forced=true" >> $GITHUB_OUTPUT
-          else
-             echo "forced=false" >> $GITHUB_OUTPUT
-          fi
-          
-          # Перевіряємо старий SHA
-          if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" == "${{ steps.get_sha.outputs.sha }}" ]; then
-             echo "match=true" >> $GITHUB_OUTPUT
-          else
-             echo "match=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Exit if no new changes
-        # Виходимо тільки якщо SHA співпадає І це НЕ примусовий запуск через файл 'update'
-        if: steps.check_status.outputs.match == 'true' && steps.check_status.outputs.forced == 'false'
-        run: |
-          echo "No new commits found and not forced. Skipping build."
-          exit 0
-
-      - name: Clone Original Ferrum
-        run: git clone https://github.com/PlusMarden17/ferrum.git source
-
-      - name: Set up JDK 17
+      - name: Set up JDK 8
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '8'
           distribution: 'temurin'
 
-      - name: Build Ferrum
+      - name: Clone and Find Stable Commit
+        id: build_logic
         run: |
+          git clone https://github.com/PlusMarden17/ferrum.git source
           cd source
           chmod +x gradlew
-          ./gradlew build
+          
+          # Отримуємо список останніх 10 комітів
+          COMMITS=$(git log -n 10 --format="%H")
+          
+          SUCCESS_SHA=""
+          
+          for SHA in $COMMITS; do
+            echo "------------------------------------------------"
+            echo "Checking commit: $SHA"
+            git checkout $SHA
+            
+            # Спроба збірки
+            if ./gradlew clean assemble; then
+              echo "SUCCESS: Commit $SHA is stable!"
+              SUCCESS_SHA=$SHA
+              break
+            else
+              echo "FAILED: Commit $SHA is broken. Trying previous..."
+            fi
+          done
+          
+          if [ -z "$SUCCESS_SHA" ]; then
+            echo "Error: None of the last 10 commits are buildable."
+            exit 1
+          fi
+          
+          echo "stable_sha=$SUCCESS_SHA" >> $GITHUB_OUTPUT
+          # Копіюємо JAR для наступних кроків
+          mkdir -p ../output
+          cp build/libs/*.jar ../output/ferrum.jar
 
-      - name: Rename JAR for consistency
-        run: mv source/build/libs/*.jar source/build/libs/ferrum.jar
+      - name: Check if Stable SHA is new
+        id: check_new
+        run: |
+          STABLE="${{ steps.build_logic.outputs.stable_sha }}"
+          if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" == "$STABLE" ] && [ "${{ github.event_name }}" != "push" ]; then
+             echo "new_found=false" >> $GITHUB_OUTPUT
+          else
+             echo "new_found=true" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Create Release and Upload JAR
+      - name: Create Release
+        if: steps.check_new.outputs.new_found == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.get_sha.outputs.sha }}-${{ github.run_number }}
-          name: "Build: ${{ steps.get_sha.outputs.sha }}"
-          body: |
-            Автоматична збірка бібліотеки Ferrum.
-            Коміт: ${{ steps.get_sha.outputs.sha }}
-            Тип запуску: ${{ steps.check_status.outputs.forced == 'true' && 'Примусовий (update)' || 'Автоматичний' }}
-          files: source/build/libs/ferrum.jar
+          tag_name: v${{ steps.build_logic.outputs.stable_sha }}-${{ github.run_number }}
+          name: "Stable Build: ${{ steps.build_logic.outputs.stable_sha }}"
+          body: "Ця збірка знайдена автоматичним перебором останніх комітів до першого стабільного."
+          files: output/ferrum.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update last_sha.txt in repo
+      - name: Update last_sha.txt
+        if: steps.check_new.outputs.new_found == 'true'
         run: |
-          echo "${{ steps.get_sha.outputs.sha }}" > last_sha.txt
+          echo "${{ steps.build_logic.outputs.stable_sha }}" > last_sha.txt
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
           git add last_sha.txt
-          git commit -m "Update last built SHA to ${{ steps.get_sha.outputs.sha }} [skip ci]" || echo "No changes to commit"
+          git commit -m "Update last stable SHA to ${{ steps.build_logic.outputs.stable_sha }} [skip ci]" || echo "No changes"
           git push
