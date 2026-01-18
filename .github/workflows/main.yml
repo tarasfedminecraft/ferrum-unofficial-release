@@ -38,22 +38,22 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Cache Gradle
+      - name: Cache Build Tools
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('source/**/gradle-wrapper.properties') }}-${{ hashFiles('source/**') }}
+            ~/.m2/repository
+          key: ${{ runner.os }}-build-${{ hashFiles('source/**/build.gradle*', 'source/**/pom.xml') }}
           restore-keys: |
-            ${{ runner.os }}-gradle-
+            ${{ runner.os }}-build-
 
-      - name: Find stable commit and build
+      - name: Find stable commit and build (Hybrid Maven/Gradle)
         id: build_logic
         working-directory: source
         run: |
           set -euo pipefail
-          chmod +x gradlew || true
 
           COMMITS=$(git rev-list --max-count=50 HEAD)
           SUCCESS_SHA=""
@@ -66,24 +66,43 @@ jobs:
             git clean -fdx || true
             git checkout "$SHA" || { echo "Cannot checkout $SHA"; continue; }
 
-            # ФІКС АВТОРА: переміщуємо файлову структуру якщо потрібно
+            # ФІКС СТРУКТУРИ: універсальний для обох систем
             if [ -d "src/main/java/ferrum" ]; then
-              echo "Fixing directory structure for $SHA..."
+              echo "Fixing directory structure..."
               mkdir -p src/main/java/io/coconut/ferrum
               mv src/main/java/ferrum/* src/main/java/io/coconut/ferrum/ 2>/dev/null || true
             fi
 
-            if ./gradlew clean assemble -x test --no-daemon --no-configuration-cache; then
-              # знайдемо перший jar в build/libs
-              JAR=$(ls -1 build/libs/*.jar 2>/dev/null | head -n 1 || true)
-              if [ -n "$JAR" ]; then
-                echo "SUCCESS: Found working commit $SHA -> $JAR"
-                SUCCESS_SHA=$SHA
-                mkdir -p ../output
-                cp "$JAR" ../output/ferrum.jar
-                break
-              else
-                echo "Build succeeded but no jar found for $SHA"
+            # 1. СПРОБА GRADLE
+            if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+              echo "Detected Gradle project"
+              # Створюємо wrapper якщо автор його не додав
+              if [ ! -f "gradlew" ]; then
+                gradle wrapper --gradle-version 8.5
+              fi
+              chmod +x gradlew
+              
+              if ./gradlew clean assemble -x test --no-daemon --no-configuration-cache; then
+                JAR=$(ls -1 build/libs/*.jar 2>/dev/null | grep -v "sources" | grep -v "javadoc" | head -n 1 || true)
+                if [ -n "$JAR" ]; then
+                  echo "SUCCESS: Gradle build $SHA"
+                  SUCCESS_SHA=$SHA
+                  mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
+                  break
+                fi
+              fi
+
+            # 2. СПРОБА MAVEN
+            elif [ -f "pom.xml" ]; then
+              echo "Detected Maven project"
+              if mvn clean package -DskipTests -B; then
+                JAR=$(ls -1 target/*.jar 2>/dev/null | grep -v "sources" | grep -v "javadoc" | head -n 1 || true)
+                if [ -n "$JAR" ]; then
+                  echo "SUCCESS: Maven build $SHA"
+                  SUCCESS_SHA=$SHA
+                  mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
+                  break
+                fi
               fi
             fi
 
@@ -91,24 +110,21 @@ jobs:
           done
 
           if [ -z "$SUCCESS_SHA" ]; then
-            echo "Error: Could not find any working commit in the last 50 attempts."
+            echo "Error: No working build (Gradle/Maven) found in 50 commits."
             exit 1
           fi
 
           echo "stable_sha=$SUCCESS_SHA" >> $GITHUB_OUTPUT
 
-      - name: Persist last stable SHA and push (if changed)
+      - name: Persist last stable SHA and push
         if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         env:
           STABLE: ${{ steps.build_logic.outputs.stable_sha }}
           BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          echo "Stable commit: $STABLE"
-
-          # Якщо нічого не змінилося — і не push-тригер — вихід
           if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" = "$STABLE" ] && [ "${{ github.event_name }}" != "push" ]; then
-            echo "No new stable version found."
+            echo "No new stable version."
             exit 0
           fi
 
@@ -117,13 +133,10 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add last_sha.txt
           git commit -m "New stable version: $STABLE [skip ci]" || echo "Nothing to commit"
-
-          # створюємо або оновлюємо тег і пушимо в ту гілку, звідки workflow запущено
           git tag -fa "v$STABLE" -m "Ferrum stable $STABLE" || true
-          # push з використанням збережених credentials від checkout (persist-credentials: true)
           git push origin "HEAD:${BRANCH}" --follow-tags || git push --follow-tags || true
 
-      - name: Create Release and upload artifact
+      - name: Create Release
         if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         uses: softprops/action-gh-release@v2
         with:
