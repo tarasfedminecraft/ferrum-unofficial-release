@@ -16,12 +16,14 @@ jobs:
       cancel-in-progress: true
     permissions:
       contents: write
+      packages: write
 
     steps:
       - name: Checkout repository (workflow repo)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Checkout Ferrum source
         uses: actions/checkout@v4
@@ -59,8 +61,10 @@ jobs:
           for SHA in $COMMITS; do
             echo "------------------------------------------------"
             echo "Testing SHA: $SHA"
+
             git reset --hard
-            git checkout "$SHA" || continue
+            git clean -fdx || true
+            git checkout "$SHA" || { echo "Cannot checkout $SHA"; continue; }
 
             # ФІКС АВТОРА: переміщуємо файлову структуру якщо потрібно
             if [ -d "src/main/java/ferrum" ]; then
@@ -70,12 +74,19 @@ jobs:
             fi
 
             if ./gradlew clean assemble -x test --no-daemon --no-configuration-cache; then
-              if ls build/libs/*.jar 1> /dev/null 2>&1; then
-                echo "SUCCESS: Found working commit $SHA"
+              # знайдемо перший jar в build/libs
+              JAR=$(ls -1 build/libs/*.jar 2>/dev/null | head -n 1 || true)
+              if [ -n "$JAR" ]; then
+                echo "SUCCESS: Found working commit $SHA -> $JAR"
                 SUCCESS_SHA=$SHA
+                mkdir -p ../output
+                cp "$JAR" ../output/ferrum.jar
                 break
+              else
+                echo "Build succeeded but no jar found for $SHA"
               fi
             fi
+
             echo "FAILED: Commit $SHA is unusable."
           done
 
@@ -85,11 +96,9 @@ jobs:
           fi
 
           echo "stable_sha=$SUCCESS_SHA" >> $GITHUB_OUTPUT
-          mkdir -p ../output
-          cp build/libs/*.jar ../output/ferrum.jar
 
       - name: Persist last stable SHA and push (if changed)
-        if: steps.build_logic.outputs.stable_sha != ''
+        if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         env:
           STABLE: ${{ steps.build_logic.outputs.stable_sha }}
           BRANCH: ${{ github.ref_name }}
@@ -111,10 +120,11 @@ jobs:
 
           # створюємо або оновлюємо тег і пушимо в ту гілку, звідки workflow запущено
           git tag -fa "v$STABLE" -m "Ferrum stable $STABLE" || true
+          # push з використанням збережених credentials від checkout (persist-credentials: true)
           git push origin "HEAD:${BRANCH}" --follow-tags || git push --follow-tags || true
 
       - name: Create Release and upload artifact
-        if: steps.build_logic.outputs.stable_sha != ''
+        if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.build_logic.outputs.stable_sha }}
