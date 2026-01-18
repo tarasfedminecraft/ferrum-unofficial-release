@@ -1,4 +1,4 @@
-name: Watch and Build Ferrum (Ultimate Fix)
+name: Watch and Build Ferrum (Improved)
 
 on:
   schedule:
@@ -12,18 +12,20 @@ jobs:
   check_and_build:
     runs-on: ubuntu-latest
     concurrency:
-      group: ferrum-stable
+      group: ferrum-stable-${{ github.repository }}
       cancel-in-progress: true
+
     permissions:
       contents: write
       packages: write
 
     steps:
-      - name: Checkout repository (workflow repo)
+      - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout Ferrum source
         uses: actions/checkout@v4
@@ -31,14 +33,15 @@ jobs:
           repository: PlusMarden17/ferrum
           path: source
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '21'
-          distribution: 'temurin'
 
-      - name: Cache Build Tools
+      - name: Cache build tool caches
         uses: actions/cache@v4
         with:
           path: |
@@ -54,9 +57,17 @@ jobs:
         working-directory: source
         run: |
           set -euo pipefail
+          echo "Starting commit scan (last 50 commits)..."
 
-          COMMITS=$(git rev-list --max-count=50 HEAD)
+          COMMITS=$(git rev-list --max-count=50 HEAD) || { echo "Cannot list commits"; exit 1; }
           SUCCESS_SHA=""
+
+          find_jar() {
+            # Prefer typical build output locations, avoid picking up caches.
+            JAR=$(find . \( -path "*/build/libs/*.jar" -o -path "*/target/*.jar" \) \
+                  ! -iname "*sources*.jar" ! -iname "*javadoc*.jar" -print | head -n 1 || true)
+            echo "$JAR"
+          }
 
           for SHA in $COMMITS; do
             echo "------------------------------------------------"
@@ -64,46 +75,64 @@ jobs:
 
             git reset --hard
             git clean -fdx || true
-            git checkout "$SHA" || { echo "Cannot checkout $SHA"; continue; }
+            if ! git checkout "$SHA" --quiet; then
+              echo "Cannot checkout $SHA"
+              continue
+            fi
 
-            # ФІКС СТРУКТУРИ: універсальний для обох систем
-            if [ -d "src/main/java/ferrum" ]; then
-              echo "Fixing directory structure..."
-              mkdir -p src/main/java/io/coconut/ferrum
+            # Optional: try to fix directory layout if old structure exists (be conservative)
+            if [ -d "src/main/java/ferrum" ] && [ ! -d "src/main/java/io/coconut/ferrum" ]; then
+              echo "Fixing directory structure (best-effort)..."
+              mkdir -p src/main/java/io/coconut/ferrum || true
               mv src/main/java/ferrum/* src/main/java/io/coconut/ferrum/ 2>/dev/null || true
             fi
 
-            # 1. СПРОБА GRADLE
-            if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            # 1) Gradle (prefer wrapper)
+            if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -d "gradle" ]; then
               echo "Detected Gradle project"
-              # Створюємо wrapper якщо автор його не додав
-              if [ ! -f "gradlew" ]; then
-                gradle wrapper --gradle-version 8.5
-              fi
-              chmod +x gradlew
-              
-              if ./gradlew clean assemble -x test --no-daemon --no-configuration-cache; then
-                JAR=$(ls -1 build/libs/*.jar 2>/dev/null | grep -v "sources" | grep -v "javadoc" | head -n 1 || true)
-                if [ -n "$JAR" ]; then
-                  echo "SUCCESS: Gradle build $SHA"
-                  SUCCESS_SHA=$SHA
-                  mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
-                  break
+
+              if [ -x "./gradlew" ]; then
+                echo "Using project gradle wrapper"
+                chmod +x ./gradlew
+                if ./gradlew clean assemble -x test --no-daemon --stacktrace; then
+                  JAR=$(find_jar)
+                  if [ -n "$JAR" ]; then
+                    echo "SUCCESS: Gradle build $SHA (wrapper)"
+                    SUCCESS_SHA=$SHA
+                    mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
+                    break
+                  else
+                    echo "Gradle build produced no jar at expected locations."
+                  fi
+                else
+                  echo "Gradle wrapper build failed for $SHA."
                 fi
+              else
+                echo "No gradle wrapper present; skipping system gradle install (safer)."
               fi
 
-            # 2. СПРОБА MAVEN
+            # 2) Maven
             elif [ -f "pom.xml" ]; then
               echo "Detected Maven project"
-              if mvn clean package -DskipTests -B; then
-                JAR=$(ls -1 target/*.jar 2>/dev/null | grep -v "sources" | grep -v "javadoc" | head -n 1 || true)
-                if [ -n "$JAR" ]; then
-                  echo "SUCCESS: Maven build $SHA"
-                  SUCCESS_SHA=$SHA
-                  mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
-                  break
+              if command -v mvn >/dev/null 2>&1; then
+                if mvn -B -DskipTests clean package; then
+                  JAR=$(find_jar)
+                  if [ -n "$JAR" ]; then
+                    echo "SUCCESS: Maven build $SHA"
+                    SUCCESS_SHA=$SHA
+                    mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
+                    break
+                  else
+                    echo "Maven build produced no jar at expected locations."
+                  fi
+                else
+                  echo "Maven build failed for $SHA."
                 fi
+              else
+                echo "Maven not present on runner; skipping this commit."
               fi
+            else
+              echo "No recognized build system (Gradle/Maven) at commit $SHA."
             fi
 
             echo "FAILED: Commit $SHA is unusable."
@@ -114,7 +143,7 @@ jobs:
             exit 1
           fi
 
-          echo "stable_sha=$SUCCESS_SHA" >> $GITHUB_OUTPUT
+          echo "stable_sha=$SUCCESS_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Persist last stable SHA and push
         if: ${{ steps.build_logic.outputs.stable_sha != '' }}
@@ -123,6 +152,8 @@ jobs:
           BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+
+          # If last_sha.txt exists and unchanged, skip (unless push event)
           if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" = "$STABLE" ] && [ "${{ github.event_name }}" != "push" ]; then
             echo "No new stable version."
             exit 0
@@ -133,8 +164,16 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add last_sha.txt
           git commit -m "New stable version: $STABLE [skip ci]" || echo "Nothing to commit"
+
           git tag -fa "v$STABLE" -m "Ferrum stable $STABLE" || true
           git push origin "HEAD:${BRANCH}" --follow-tags || git push --follow-tags || true
+
+      - name: Upload built jar as artifact (for debugging / backup)
+        if: ${{ steps.build_logic.outputs.stable_sha != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-jar
+          path: output/ferrum.jar
 
       - name: Create Release
         if: ${{ steps.build_logic.outputs.stable_sha != '' }}
