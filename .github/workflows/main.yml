@@ -41,105 +41,97 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Cache build tool caches
+      - name: Cache build tools and failed commits
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
             ~/.m2/repository
-          key: ${{ runner.os }}-build-${{ hashFiles('source/**/build.gradle*', 'source/**/pom.xml') }}
+            failed_commits.txt
+          # Використовуємо run_id у ключі, щоб кеш зберігався після кожного запуску
+          key: ${{ runner.os }}-build-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-build-
 
-      - name: Find stable commit and build (Hybrid Maven/Gradle)
+      - name: Find stable commit and build (with Failure Cache)
         id: build_logic
         working-directory: source
         run: |
           set -euo pipefail
-          echo "Starting commit scan (last 50 commits)..."
+          
+          # Підготовка файлу чорного списку (виходимо на рівень вище від папки source)
+          touch ../failed_commits.txt
+          echo "--- Known failed commits ---"
+          cat ../failed_commits.txt || true
+          echo "----------------------------"
 
           COMMITS=$(git rev-list --max-count=50 HEAD) || { echo "Cannot list commits"; exit 1; }
           SUCCESS_SHA=""
 
           find_jar() {
-            # Prefer typical build output locations, avoid picking up caches.
             JAR=$(find . \( -path "*/build/libs/*.jar" -o -path "*/target/*.jar" \) \
                   ! -iname "*sources*.jar" ! -iname "*javadoc*.jar" -print | head -n 1 || true)
             echo "$JAR"
           }
 
           for SHA in $COMMITS; do
-            echo "------------------------------------------------"
+            # Перевірка, чи ми вже знаємо, що цей коміт зламаний
+            if grep -q "$SHA" ../failed_commits.txt; then
+              echo "Skipping $SHA: Already known as FAILED."
+              continue
+            fi
+
             echo "Testing SHA: $SHA"
 
             git reset --hard
             git clean -fdx || true
             if ! git checkout "$SHA" --quiet; then
-              echo "Cannot checkout $SHA"
+              echo "$SHA" >> ../failed_commits.txt
               continue
             fi
 
-            # Optional: try to fix directory layout if old structure exists (be conservative)
+            # Спроба виправлення структури для старих версій
             if [ -d "src/main/java/ferrum" ] && [ ! -d "src/main/java/io/coconut/ferrum" ]; then
-              echo "Fixing directory structure (best-effort)..."
               mkdir -p src/main/java/io/coconut/ferrum || true
               mv src/main/java/ferrum/* src/main/java/io/coconut/ferrum/ 2>/dev/null || true
             fi
 
-            # 1) Gradle (prefer wrapper)
-            if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -d "gradle" ]; then
-              echo "Detected Gradle project"
+            BUILD_SUCCESS=false
 
+            # 1) Gradle
+            if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -d "gradle" ]; then
               if [ -x "./gradlew" ]; then
-                echo "Using project gradle wrapper"
                 chmod +x ./gradlew
-                if ./gradlew clean assemble -x test --no-daemon --stacktrace; then
-                  JAR=$(find_jar)
-                  if [ -n "$JAR" ]; then
-                    echo "SUCCESS: Gradle build $SHA (wrapper)"
-                    SUCCESS_SHA=$SHA
-                    mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
-                    break
-                  else
-                    echo "Gradle build produced no jar at expected locations."
-                  fi
-                else
-                  echo "Gradle wrapper build failed for $SHA."
+                if ./gradlew clean assemble -x test --no-daemon; then
+                  BUILD_SUCCESS=true
                 fi
-              else
-                echo "No gradle wrapper present; skipping system gradle install (safer)."
               fi
 
             # 2) Maven
             elif [ -f "pom.xml" ]; then
-              echo "Detected Maven project"
-              if command -v mvn >/dev/null 2>&1; then
-                if mvn -B -DskipTests clean package; then
-                  JAR=$(find_jar)
-                  if [ -n "$JAR" ]; then
-                    echo "SUCCESS: Maven build $SHA"
-                    SUCCESS_SHA=$SHA
-                    mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
-                    break
-                  else
-                    echo "Maven build produced no jar at expected locations."
-                  fi
-                else
-                  echo "Maven build failed for $SHA."
-                fi
-              else
-                echo "Maven not present on runner; skipping this commit."
+              if mvn -B -DskipTests clean package; then
+                BUILD_SUCCESS=true
               fi
-            else
-              echo "No recognized build system (Gradle/Maven) at commit $SHA."
             fi
 
-            echo "FAILED: Commit $SHA is unusable."
+            if [ "$BUILD_SUCCESS" = true ]; then
+              JAR=$(find_jar)
+              if [ -n "$JAR" ]; then
+                echo "SUCCESS: Found working commit $SHA"
+                SUCCESS_SHA=$SHA
+                mkdir -p ../output && cp "$JAR" ../output/ferrum.jar
+                break
+              fi
+            fi
+
+            # Якщо не вийшло — додаємо в чорний список
+            echo "FAILED: Adding $SHA to blacklist."
+            echo "$SHA" >> ../failed_commits.txt
           done
 
           if [ -z "$SUCCESS_SHA" ]; then
-            echo "Error: No working build (Gradle/Maven) found in 50 commits."
+            echo "Error: No working build found in the last 50 commits."
             exit 1
           fi
 
@@ -153,22 +145,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # If last_sha.txt exists and unchanged, skip (unless push event)
           if [ -f last_sha.txt ] && [ "$(cat last_sha.txt)" = "$STABLE" ] && [ "${{ github.event_name }}" != "push" ]; then
-            echo "No new stable version."
+            echo "No new stable version found. Skipping push."
             exit 0
           fi
 
           echo "$STABLE" > last_sha.txt
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add last_sha.txt
-          git commit -m "New stable version: $STABLE [skip ci]" || echo "Nothing to commit"
+          git add last_sha.txt failed_commits.txt || true
+          git commit -m "Update stable version to $STABLE [skip ci]" || echo "Nothing to commit"
 
           git tag -fa "v$STABLE" -m "Ferrum stable $STABLE" || true
           git push origin "HEAD:${BRANCH}" --follow-tags || git push --follow-tags || true
 
-      - name: Upload built jar as artifact (for debugging / backup)
+      - name: Upload built jar as artifact
         if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         uses: actions/upload-artifact@v4
         with:
