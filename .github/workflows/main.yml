@@ -1,4 +1,4 @@
-name: Watch and Build Ferrum (Create new release only on new commit)
+name: Watch and Build Ferrum (Improved)
 
 on:
   schedule:
@@ -12,6 +12,7 @@ jobs:
   check_and_build:
     runs-on: ubuntu-latest
     concurrency:
+      # Уникаємо конфліктів між різними гілками
       group: ferrum-stable-${{ github.repository }}-${{ github.ref_name }}
       cancel-in-progress: true
 
@@ -25,7 +26,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+          # token omitted — uses default GITHUB_TOKEN for current repo
 
+      # If the Ferrum repo is private or in another account, set a PAT secret (e.g. secrets.FERRUM_PAT)
       - name: Checkout Ferrum source
         uses: actions/checkout@v4
         with:
@@ -47,6 +50,7 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
             ~/.m2/repository
+          # Детермінований ключ — кеш відновиться між ранніми запусками, змінюється при зміні wrapper/build files
           key: ${{ runner.os }}-build-${{ hashFiles('source/**/gradle-wrapper.properties','source/**/build.gradle*','source/**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-build-
@@ -57,15 +61,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Чорний список відносно робочого каталогу
           touch ../failed_commits.txt
           echo "--- Known failed commits ---"
           cat ../failed_commits.txt || true
           echo "----------------------------"
 
+          # Перелік останніх 50 комітів
           COMMITS=$(git rev-list --max-count=50 HEAD) || { echo "Cannot list commits"; exit 1; }
           SUCCESS_SHA=""
 
           find_jar() {
+            # Пошук jar (враховуємо як Gradle так і Maven)
             JAR=$(find . \( -path "*/build/libs/*.jar" -o -path "*/target/*.jar" \) \
                   ! -iname "*sources*.jar" ! -iname "*javadoc*.jar" -print | head -n 1 || true)
             echo "$JAR"
@@ -87,6 +94,7 @@ jobs:
               continue
             fi
 
+            # Попередні спроби виправлення структури для старих версій
             if [ -d "src/main/java/ferrum" ] && [ ! -d "src/main/java/io/coconut/ferrum" ]; then
               mkdir -p src/main/java/io/coconut/ferrum || true
               mv src/main/java/ferrum/* src/main/java/io/coconut/ferrum/ 2>/dev/null || true
@@ -94,6 +102,7 @@ jobs:
 
             BUILD_SUCCESS=false
 
+            # 1) Gradle wrapper if present
             if [ -f "./gradlew" ]; then
               chmod +x ./gradlew || true
               echo "Using ./gradlew to build..."
@@ -103,6 +112,7 @@ jobs:
                 echo "Gradle wrapper build failed for $SHA"
               fi
 
+            # 2) Maven if present
             elif [ -f "pom.xml" ]; then
               echo "Using mvn to build..."
               if mvn -B -DskipTests clean package; then
@@ -132,23 +142,24 @@ jobs:
           done
 
           if [ -z "$SUCCESS_SHA" ]; then
-            echo "No working build found in the last 50 commits."
+            echo "Error: No working build found in the last 50 commits."
             exit 1
           fi
 
           echo "stable_sha=$SUCCESS_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Read commit subject and body for stable SHA
+        if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         id: commit_info
         run: |
           set -euo pipefail
           SHA="${{ steps.build_logic.outputs.stable_sha }}"
-          # subject
+          # subject (one-line)
           SUBJECT=$(git -C source log -1 --pretty=format:%s "$SHA" || true)
           # body (may be multiline)
           BODY=$(git -C source log -1 --pretty=format:%b "$SHA" || true)
 
-          # write as outputs (multi-line safe)
+          # write as step outputs (multi-line safe)
           echo "commit_subject<<EOF" >> $GITHUB_OUTPUT
           echo "$SUBJECT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -158,6 +169,7 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Check if this stable SHA is new compared to last_sha.txt
+        if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         id: check_new
         env:
           STABLE: ${{ steps.build_logic.outputs.stable_sha }}
@@ -173,10 +185,11 @@ jobs:
             echo "new_release=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Persist last stable SHA and commit (only for new release)
+      - name: Persist last stable SHA and push (only for new release)
         if: ${{ steps.check_new.outputs.new_release == 'true' }}
         env:
           STABLE: ${{ steps.build_logic.outputs.stable_sha }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           echo "$STABLE" > last_sha.txt
@@ -184,10 +197,13 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add last_sha.txt failed_commits.txt || true
           git commit -m "Update stable version to $STABLE [skip ci]" || echo "Nothing to commit"
-          # push commit (may fail silently if no permission)
-          git push origin "HEAD:${{ github.ref_name }}" || true
 
-      - name: Upload built jar as artifact (always keep for debugging) 
+          # create an annotated tag for traceability (if already exists, force it)
+          git tag -fa "v$STABLE" -m "Ferrum stable $STABLE" || true
+          # Push back to the workflow repo (requires persist-credentials: true and contents: write permission)
+          git push origin "HEAD:${BRANCH}" --follow-tags || git push --follow-tags || true
+
+      - name: Upload built jar as artifact
         if: ${{ steps.build_logic.outputs.stable_sha != '' }}
         uses: actions/upload-artifact@v4
         with:
@@ -199,8 +215,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.build_logic.outputs.stable_sha }}
-          name: ${{ steps.commit_info.outputs.commit_subject }}
-          body: ${{ steps.commit_info.outputs.commit_body }}
+          # Назва релізу = тіло коміту (опис того, що змінено)
+          name: ${{ steps.commit_info.outputs.commit_body }}
+          # Опис релізу = посилання на конкретний коміт
+          body: "https://github.com/${{ github.repository }}/commit/${{ steps.build_logic.outputs.stable_sha }}"
           files: output/ferrum.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
